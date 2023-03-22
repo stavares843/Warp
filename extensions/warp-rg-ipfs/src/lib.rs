@@ -6,6 +6,7 @@ use crate::spam_filter::SpamFilter;
 use config::RgIpfsConfig;
 use futures::StreamExt;
 use rust_ipfs::Ipfs;
+use warp::raygun::Messages;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -23,7 +24,6 @@ use warp::logging::tracing::log::trace;
 use warp::module::Module;
 use warp::multipass::MultiPass;
 use warp::pocket_dimension::PocketDimension;
-use warp::raygun::group::{GroupChat, GroupChatManagement, GroupInvite};
 use warp::raygun::{
     Conversation, Location, MessageEvent, MessageEventStream, MessageStatus, RayGunEventStream,
     RayGunEvents, RayGunGroupConversation, RayGunStream,
@@ -283,7 +283,7 @@ impl RayGun for IpfsMessaging {
         &self,
         conversation_id: Uuid,
         opt: MessageOptions,
-    ) -> Result<Vec<Message>> {
+    ) -> Result<Messages> {
         self.messaging_store()?
             .get_messages(conversation_id, opt)
             .await
@@ -444,11 +444,6 @@ impl RayGunEvents for IpfsMessaging {
     }
 }
 
-impl GroupChat for IpfsMessaging {}
-
-impl GroupChatManagement for IpfsMessaging {}
-
-impl GroupInvite for IpfsMessaging {}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ffi {

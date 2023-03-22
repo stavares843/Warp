@@ -2,7 +2,6 @@ use clap::Parser;
 use comfy_table::Table;
 use futures::prelude::*;
 use rustyline_async::{Readline, ReadlineError, SharedWriter};
-use warp_mp_ipfs::config::Discovery;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,13 +17,14 @@ use warp::multipass::identity::Identifier;
 use warp::multipass::MultiPass;
 use warp::pocket_dimension::PocketDimension;
 use warp::raygun::{
-    ConversationType, MessageEvent, MessageEventKind, MessageEventStream, MessageOptions,
-    MessageType, PinState, RayGun, ReactionState,
+    ConversationType, Message, MessageEvent, MessageEventKind, MessageEventStream, MessageOptions,
+    MessageStream, MessageType, Messages, MessagesType, PinState, RayGun, ReactionState,
 };
 use warp::sync::{Arc, RwLock};
 use warp::tesseract::Tesseract;
 use warp_fs_ipfs::config::FsIpfsConfig;
-use warp_fs_ipfs::{IpfsFileSystem};
+use warp_fs_ipfs::IpfsFileSystem;
+use warp_mp_ipfs::config::Discovery;
 use warp_mp_ipfs::{ipfs_identity_persistent, ipfs_identity_temporary};
 use warp_pd_flatfile::FlatfileStorage;
 use warp_pd_stretto::StrettoClient;
@@ -129,7 +129,7 @@ async fn create_account<P: AsRef<Path>>(
         config.ipfs_setting.bootstrap = bootstrap;
     }
 
-    config.store_setting.wait_on_response = opt.wait;
+    config.store_setting.friend_request_response_duration = opt.wait;
 
     config.ipfs_setting.mdns.enable = opt.mdns;
 
@@ -177,13 +177,12 @@ async fn create_rg(
     config.store_setting.disable_sender_event_emit = disable_sender_emitter;
 
     let chat = match path.as_ref() {
-        Some(_) => Box::new(
-            IpfsMessaging::new(Some(config), account, filesystem, Some(cache))
-                .await?,
-        ) as Box<dyn RayGun>,
-        None => Box::new(
-            IpfsMessaging::new(Some(config), account, filesystem, Some(cache)).await?,
-        ) as Box<dyn RayGun>,
+        Some(_) => {
+            Box::new(IpfsMessaging::new(Some(config), account, filesystem, Some(cache)).await?)
+                as Box<dyn RayGun>
+        }
+        None => Box::new(IpfsMessaging::new(Some(config), account, filesystem, Some(cache)).await?)
+            as Box<dyn RayGun>,
     };
 
     Ok(chat)
@@ -226,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
         cache.clone(),
         Zeroizing::new(password),
         opt.experimental_node,
-        &opt
+        &opt,
     )
     .await?;
 
@@ -550,29 +549,55 @@ async fn main() -> anyhow::Result<()> {
                             writeln!(stdout, "{table}")?;
                         },
                         Some("/list") => {
-                            let mut table = Table::new();
-                            table.set_header(vec!["Message ID", "Type", "Conversation ID", "Date", "Modified", "Sender", "Message", "Pinned", "Reaction"]);
-                            let local_topic = *topic.read();
 
-                            let opt = match cmd_line.next() {
-                                Some(id) => match id.parse() {
-                                    Ok(last) => MessageOptions::default().set_range(0..last),
+                            let local_topic = *topic.read();
+                            let mut lower_range = None;
+                            let mut upper_range = None;
+
+                            if let Some(id) = cmd_line.next() {
+                                match id.parse() {
+                                    Ok(lower) => {
+                                        lower_range = Some(lower);
+                                        if let Some(id) = cmd_line.next() {
+                                            match id.parse() {
+                                                Ok(upper) => {
+                                                    upper_range = Some(upper);
+                                                },
+                                                Err(e) => {
+                                                    writeln!(stdout, "Error parsing upper range: {e}")?;
+                                                    continue
+                                                }
+                                            }
+                                        }
+                                    },
                                     Err(e) => {
-                                        writeln!(stdout, "Error parsing range: {e}")?;
+                                        writeln!(stdout, "Error parsing lower range: {e}")?;
                                         continue
                                     }
-                                },
-                                None => MessageOptions::default()
+                                }
                             };
 
-                            let messages = match chat.get_messages(local_topic, opt).await {
+                            let mut opt = MessageOptions::default();
+                            if let Some(lower) = lower_range {
+                                if let Some(upper) = upper_range {
+                                    opt = opt.set_range(lower..upper);
+                                } else {
+                                    opt = opt.set_range(0..lower);
+                                }
+                            }
+
+                            let mut messages_stream = match chat.get_messages(local_topic, opt.set_messages_type(MessagesType::Stream)).await.and_then(MessageStream::try_from) {
                                 Ok(list) => list,
                                 Err(e) => {
                                     writeln!(stdout, "Error: {e}")?;
                                     continue;
                                 }
                             };
-                            for message in messages.iter() {
+
+
+                            let mut table = Table::new();
+                            table.set_header(vec!["Message ID", "Type", "Conversation ID", "Date", "Modified", "Sender", "Message", "Pinned", "Reaction"]);
+                            while let Some(message) = messages_stream.next().await {
                                 let username = get_username(new_account.clone(), message.sender()).await.unwrap_or_else(|_| message.sender().to_string());
                                 let mut emojis = vec![];
                                 for reaction in message.reactions() {
@@ -590,13 +615,85 @@ async fn main() -> anyhow::Result<()> {
                                     &emojis.join(" ")
                                 ]);
                             }
-                            writeln!(stdout, "{table}")?;
+                            writeln!(stdout, "{table}")?
+
+
+                        },
+                        Some("/list-pages") => {
+
+                            let local_topic = *topic.read();
+                            let mut page_or_amount: Option<usize> = None;
+                            let mut amount_per_page: Option<usize> = page_or_amount.map(|o| if o == 0 { u8::MAX as _} else { o }).or(Some(10));
+
+                            if let Some(id) = cmd_line.next() {
+                                match id.parse() {
+                                    Ok(a_o_p) => {
+                                        page_or_amount = Some(a_o_p);
+                                    },
+                                    Err(e) => {
+                                        writeln!(stdout, "Error parsing: {e}")?;
+                                        continue
+                                    }
+                                }
+                            };
+
+                            if let Some(id) = cmd_line.next() {
+                                match id.parse() {
+                                    Ok(amount) => {
+                                        amount_per_page = Some(amount);
+                                    },
+                                    Err(e) => {
+                                        writeln!(stdout, "Error parsing: {e}")?;
+                                        continue
+                                    }
+                                }
+                            };
+
+                            let opt = MessageOptions::default().set_messages_type(MessagesType::Pages { page: page_or_amount, amount_per_page} );
+
+                            let pages = match chat.get_messages(local_topic, opt).await {
+                                Ok(list) => list,
+                                Err(e) => {
+                                    writeln!(stdout, "Error: {e}")?;
+                                    continue;
+                                }
+                            };
+
+                            let mut table = Table::new();
+                            table.set_header(vec!["Page", "Message ID", "Type", "Conversation ID", "Date", "Modified", "Sender", "Message", "Pinned", "Reaction"]);
+                            if let Messages::Page { pages, total } = pages {
+                                for page in pages {
+                                    let page_id = page.id();
+                                    for message in page.messages() {
+                                        let username = get_username(new_account.clone(), message.sender()).await.unwrap_or_else(|_| message.sender().to_string());
+                                        let mut emojis = vec![];
+                                        for reaction in message.reactions() {
+                                            emojis.push(reaction.emoji());
+                                        }
+                                        table.add_row(vec![
+                                            &format!("{}", page_id),
+                                            &message.id().to_string(),
+                                            &message.message_type().to_string(),
+                                            &message.conversation_id().to_string(),
+                                            &message.date().to_string(),
+                                            &message.modified().map(|d| d.to_string()).unwrap_or_else(|| "N/A".into()),
+                                            &username,
+                                            &message.value().join("\n"),
+                                            &format!("{}", message.pinned()),
+                                            &emojis.join(" ")
+                                        ]);
+                                    }
+                                }
+
+                                writeln!(stdout, "{table}")?;
+                                writeln!(stdout, "Total Pages: {total}")?
+                            }
                         },
                         Some("/get-first") => {
                             let mut table = Table::new();
                             table.set_header(vec!["Message ID", "Type", "Conversation ID", "Date", "Modified", "Sender", "Message", "Pinned", "Reaction"]);
                             let local_topic = *topic.read();
-                            let messages = match chat.get_messages(local_topic, MessageOptions::default().set_first_message()).await {
+                            let messages = match chat.get_messages(local_topic, MessageOptions::default().set_first_message()).await.and_then(Vec::<Message>::try_from) {
                                 Ok(list) => list,
                                 Err(e) => {
                                     writeln!(stdout, "Error: {e}")?;
@@ -628,7 +725,7 @@ async fn main() -> anyhow::Result<()> {
                             table.set_header(vec!["Message ID", "Type", "Conversation ID", "Date", "Modified", "Sender", "Message", "Pinned", "Reaction"]);
                             let local_topic = *topic.read();
 
-                            let messages = match chat.get_messages(local_topic, MessageOptions::default().set_last_message()).await {
+                            let messages = match chat.get_messages(local_topic, MessageOptions::default().set_last_message()).await.and_then(Vec::<Message>::try_from) {
                                 Ok(list) => list,
                                 Err(e) => {
                                     writeln!(stdout, "Error: {e}")?;
@@ -667,7 +764,8 @@ async fn main() -> anyhow::Result<()> {
                             }
 
                             let keywords = keywords.join(" ").to_string();
-                            let messages = match chat.get_messages(local_topic, MessageOptions::default().set_keyword(&keywords)).await {
+
+                            let mut messages_stream = match chat.get_messages(local_topic, MessageOptions::default().set_keyword(&keywords).set_messages_type(MessagesType::Stream)).await.and_then(MessageStream::try_from) {
                                 Ok(list) => list,
                                 Err(e) => {
                                     writeln!(stdout, "Error: {e}")?;
@@ -675,7 +773,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             };
 
-                            for message in messages.iter() {
+                            while let Some(message) = messages_stream.next().await {
                                 let username = get_username(new_account.clone(), message.sender()).await.unwrap_or_else(|_| message.sender().to_string());
                                 let mut emojis = vec![];
                                 for reaction in message.reactions() {
@@ -932,7 +1030,7 @@ async fn main() -> anyhow::Result<()> {
                                         async move {
                                             let messages = chat
                                                 .get_messages(topic, MessageOptions::default())
-                                                .await.unwrap_or_default();
+                                                .await.and_then(Vec::<Message>::try_from).unwrap_or_default();
                                             for message in messages.iter() {
                                                 match chat.pin(topic, message.id(), PinState::Pin).await {
                                                     Ok(_) => writeln!(stdout, "Pinned {}", message.id()).is_ok(),
@@ -966,7 +1064,7 @@ async fn main() -> anyhow::Result<()> {
                                         async move {
                                             let messages = chat
                                                 .get_messages(topic, MessageOptions::default())
-                                                .await.unwrap_or_default();
+                                                .await.and_then(Vec::<Message>::try_from).unwrap_or_default();
                                             for message in messages.iter() {
                                                 match chat.pin(topic, message.id(), PinState::Unpin).await {
                                                     Ok(_) => writeln!(stdout, "Unpinned {}", message.id()).is_ok(),
@@ -1253,10 +1351,7 @@ async fn message_event_handle(
                         .await
                         .unwrap_or_else(|_| recipient.to_string());
 
-                    writeln!(
-                        stdout,
-                        ">>> {username} was removed from {conversation_id}"
-                    )?;
+                    writeln!(stdout, ">>> {username} was removed from {conversation_id}")?;
                 }
             }
         }

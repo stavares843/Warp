@@ -1,18 +1,20 @@
 pub mod conversation;
 pub mod document;
 pub mod message;
+pub mod keystore;
+
 use rust_ipfs as ipfs;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rust_ipfs::{ PeerId};
+use rust_ipfs::PeerId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use warp::{
     crypto::{
         did_key::{CoreSign, Generate, ECDH},
         hash::sha256_hash,
-        DIDKey, Ed25519KeyPair, KeyMaterial, DID,
+        DIDKey, Ed25519KeyPair, KeyMaterial, DID, cipher::Cipher, zeroize::Zeroizing,
     },
     error::Error,
     logging::tracing::log::{error, trace},
@@ -49,6 +51,7 @@ pub fn generate_shared_topic(did_a: &DID, did_b: &DID, seed: Option<&str>) -> an
     Uuid::from_slice(&topic_hash[..topic_hash.len() / 2]).map_err(anyhow::Error::from)
 }
 
+#[allow(deprecated)]
 fn did_to_libp2p_pub(public_key: &DID) -> anyhow::Result<ipfs::libp2p::identity::PublicKey> {
     let pk = ipfs::libp2p::identity::PublicKey::Ed25519(
         ipfs::libp2p::identity::ed25519::PublicKey::decode(&public_key.public_key_bytes())?,
@@ -58,14 +61,42 @@ fn did_to_libp2p_pub(public_key: &DID) -> anyhow::Result<ipfs::libp2p::identity:
 
 #[allow(dead_code)]
 fn libp2p_pub_to_did(public_key: &ipfs::libp2p::identity::PublicKey) -> anyhow::Result<DID> {
-    let pk = match public_key {
-        ipfs::libp2p::identity::PublicKey::Ed25519(pk) => {
+    let pk = match public_key.clone().into_ed25519() {
+        Some(pk) => {
             let did: DIDKey = Ed25519KeyPair::from_public_key(&pk.encode()).into();
             did.try_into()?
         }
         _ => anyhow::bail!(Error::PublicKeyInvalid),
     };
     Ok(pk)
+}
+
+fn ecdh_encrypt<K: AsRef<[u8]>>(did: &DID, recipient: Option<DID>, data: K) -> Result<Vec<u8>, Error> {
+    let prikey = Ed25519KeyPair::from_secret_key(&did.private_key_bytes()).get_x25519();
+    let did_pubkey = match recipient {
+        Some(did) => did.public_key_bytes(),
+        None => did.public_key_bytes(),
+    };
+
+    let pubkey = Ed25519KeyPair::from_public_key(&did_pubkey).get_x25519();
+    let prik = Zeroizing::new(prikey.key_exchange(&pubkey));
+    let data = Cipher::direct_encrypt(data.as_ref(), &prik)?;
+
+    Ok(data)
+}
+
+fn ecdh_decrypt<K: AsRef<[u8]>>(did: &DID, recipient: Option<DID>, data: K) -> Result<Vec<u8>, Error> {
+    let prikey = Ed25519KeyPair::from_secret_key(&did.private_key_bytes()).get_x25519();
+    let did_pubkey = match recipient {
+        Some(did) => did.public_key_bytes(),
+        None => did.public_key_bytes(),
+    };
+
+    let pubkey = Ed25519KeyPair::from_public_key(&did_pubkey).get_x25519();
+    let prik = Zeroizing::new(prikey.key_exchange(&pubkey));
+    let data = Cipher::direct_decrypt(data.as_ref(), &prik)?;
+
+    Ok(data)
 }
 
 // Note that this are temporary
@@ -107,7 +138,7 @@ pub enum PeerConnectionType {
     NotConnected,
 }
 
-pub async fn connected_to_peer< I: Into<PeerType>>(
+pub async fn connected_to_peer<I: Into<PeerType>>(
     ipfs: ipfs::Ipfs,
     pkey: I,
 ) -> anyhow::Result<PeerConnectionType> {
@@ -124,10 +155,7 @@ pub async fn connected_to_peer< I: Into<PeerType>>(
     })
 }
 
-pub async fn topic_discovery<S: AsRef<str>>(
-    ipfs: ipfs::Ipfs,
-    topic: S,
-) -> anyhow::Result<()> {
+pub async fn topic_discovery<S: AsRef<str>>(ipfs: ipfs::Ipfs, topic: S) -> anyhow::Result<()> {
     trace!("Performing topic discovery");
     let topic = topic.as_ref();
     let topic_hash = sha256_hash(format!("gossipsub:{topic}").as_bytes(), None);
